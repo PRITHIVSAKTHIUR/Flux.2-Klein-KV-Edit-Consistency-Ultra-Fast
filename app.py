@@ -6,64 +6,18 @@ import numpy as np
 import torch
 from PIL import Image
 from typing import List, Tuple
+import base64
+import json
+from io import BytesIO
 
 import spaces
 import gradio as gr
-
-from typing import Iterable
-
-# --------------------------- theme ---------------------------
-
-from gradio.themes import Soft
-from gradio.themes.utils import colors, fonts, sizes
-
-colors.orange_red = colors.Color(
-    name="orange_red", c50="#FFF0E5", c100="#FFE0CC", c200="#FFC299", c300="#FFA366",
-    c400="#FF8533", c500="#FF4500", c600="#E63E00", c700="#CC3700", c800="#B33000",
-    c900="#992900", c950="#802200",
-)
-
-class OrangeRedTheme(Soft):
-    def __init__(
-        self, *, primary_hue: colors.Color | str = colors.gray,
-        secondary_hue: colors.Color | str = colors.orange_red,
-        neutral_hue: colors.Color | str = colors.slate, text_size: sizes.Size | str = sizes.text_lg,
-        font: fonts.Font | str | Iterable[fonts.Font | str] = (
-            fonts.GoogleFont("Outfit"), "Arial", "sans-serif",
-        ),
-        font_mono: fonts.Font | str | Iterable[fonts.Font | str] = (
-            fonts.GoogleFont("IBM Plex Mono"), "ui-monospace", "monospace",
-        ),
-    ):
-        super().__init__(
-            primary_hue=primary_hue, secondary_hue=secondary_hue, neutral_hue=neutral_hue,
-            text_size=text_size, font=font, font_mono=font_mono,
-        )
-        super().set(
-            background_fill_primary="*primary_50",
-            background_fill_primary_dark="*primary_900",
-            body_background_fill="linear-gradient(135deg, *primary_200, *primary_100)",
-            body_background_fill_dark="linear-gradient(135deg, *primary_900, *primary_800)",
-            button_primary_text_color="white",
-            button_primary_text_color_hover="white",
-            button_primary_background_fill="linear-gradient(90deg, *secondary_500, *secondary_600)",
-            button_primary_background_fill_hover="linear-gradient(90deg, *secondary_600, *secondary_700)",
-            button_primary_background_fill_dark="linear-gradient(90deg, *secondary_600, *secondary_700)",
-            button_primary_background_fill_hover_dark="linear-gradient(90deg, *secondary_500, *secondary_600)",
-            slider_color="*secondary_500",
-            slider_color_dark="*secondary_600",
-            block_title_text_weight="600", block_border_width="3px",
-            block_shadow="*shadow_drop_lg", button_primary_shadow="*shadow_drop_lg",
-            button_large_padding="11px", color_accent_soft="*primary_100",
-            block_label_background_fill="*primary_200",
-        )
-
-orange_red_theme = OrangeRedTheme()
-
-# --------------------------- theme ---------------------------
+from gradio import Server
+from fastapi.responses import HTMLResponse
 
 MAX_SEED = np.iinfo(np.int32).max
 MAX_IMAGE_SIZE = 1024
+LANCZOS = getattr(Image, "Resampling", Image).LANCZOS
 
 dtype = torch.bfloat16
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -78,7 +32,6 @@ ADAPTER = {
     "repo": "dx8152/Flux2-Klein-9B-Consistency",
     "weights": "Klein-consistency.safetensors",
 }
-
 
 # --- Patch (required for the KV pipeline class) ---
 def apply_patch():
@@ -98,7 +51,6 @@ def apply_patch():
             print("Patch applied successfully")
         else:
             print(f"Patch output: {result.stdout}\n{result.stderr}")
-
 
 apply_patch()
 
@@ -121,8 +73,15 @@ pipe.load_lora_weights(
 pipe.set_adapters([ADAPTER["adapter_name"]], adapter_weights=[1.0])
 print(f"Adapter loaded successfully: {ADAPTER['adapter_name']}")
 
+# ── Examples Config ───────────────────────────────────────────────────────────
+EXAMPLES_CONFIG = [
+    {"images": ["examples/1.jpg"], "prompt": "Change the weather to stormy."},
+    {"images": ["examples/2.jpg"], "prompt": "Transform the scene into a snowy winter day while preserving the original subject identity, framing, and composition."},
+    {"images": ["examples/3.jpg"], "prompt": "Relight the image with soft golden sunset lighting while keeping all structures and subject details consistent."},
+    {"images": ["examples/4.jpg"], "prompt": "Make the texture high-resolution."},
+    {"images": [], "prompt": "A futuristic cyberpunk cityscape at night, neon lights reflecting in puddles, flying cars in the background."},
+]
 
-# --- Utility Functions ---
 def calc_dimensions(pil_img: Image.Image) -> Tuple[int, int]:
     """Calculates dimensions preserving aspect ratio, snapped to multiples of 8."""
     iw, ih = pil_img.size
@@ -139,156 +98,173 @@ def calc_dimensions(pil_img: Image.Image) -> Tuple[int, int]:
     new_height = max(256, min(1024, round(new_height / 8) * 8))
     return new_width, new_height
 
+def make_thumb_b64(path, max_dim=220):
+    if not os.path.exists(path):
+        return ""
+    try:
+        img = Image.open(path).convert("RGB")
+        img.thumbnail((max_dim, max_dim), LANCZOS)
+        buf = BytesIO()
+        img.save(buf, format="JPEG", quality=65)
+        return f"data:image/jpeg;base64,{base64.b64encode(buf.getvalue()).decode()}"
+    except Exception as e:
+        print(f"Thumbnail error for {path}: {e}")
+        return ""
 
-def parse_and_resize_images(gallery_items: List, target_width: int, target_height: int) -> List[Image.Image]:
-    """Extracts images from a Gradio Gallery and resizes them."""
-    if not gallery_items:
-        return None
+def encode_full_image(path):
+    if not os.path.exists(path):
+        return ""
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+        ext = path.rsplit(".", 1)[-1].lower()
+        mime = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png", "webp": "image/webp"}.get(ext, "image/jpeg")
+        return f"data:{mime};base64,{base64.b64encode(data).decode()}"
+    except Exception as e:
+        print(f"Encode error for {path}: {e}")
+        return ""
 
-    resized = []
-    for item in gallery_items:
+def build_client_config():
+    """Static config consumed by the frontend: example cards."""
+    examples = []
+    for i, ex in enumerate(EXAMPLES_CONFIG):
+        examples.append({
+            "idx": i,
+            "thumbs": [make_thumb_b64(p) for p in ex["images"]],
+            "n_images": len(ex["images"]),
+            "prompt": ex["prompt"],
+        })
+    return {
+        "examples": examples,
+    }
+
+print("Building client config (example thumbnails)…")
+CLIENT_CONFIG = build_client_config()
+print(f"Built config with {len(EXAMPLES_CONFIG)} examples.")
+
+def b64_to_pil_list(b64_json_str):
+    if not b64_json_str or b64_json_str.strip() in ("", "[]"):
+        return []
+    try:
+        b64_list = json.loads(b64_json_str)
+    except Exception:
+        return []
+    pil_images = []
+    for b64_str in b64_list:
+        if not b64_str or not isinstance(b64_str, str):
+            continue
         try:
-            # Gradio Gallery returns a list of tuples: (filepath, label)
-            filepath = item[0] if isinstance(item, (tuple, list)) else item
-            img = Image.open(filepath).convert("RGB")
-            resized.append(img.resize((target_width, target_height), Image.LANCZOS))
+            if b64_str.startswith("data:image"):
+                _, data = b64_str.split(",", 1)
+            else:
+                data = b64_str
+            image_data = base64.b64decode(data)
+            pil_images.append(Image.open(BytesIO(image_data)).convert("RGB"))
         except Exception as e:
-            print(f"Skipping invalid image: {e}")
+            print(f"Error decoding image: {e}")
+    return pil_images
 
-    return resized if resized else None
+def pil_to_b64_png(image: Image.Image) -> str:
+    buf = BytesIO()
+    image.save(buf, format="PNG")
+    return f"data:image/png;base64,{base64.b64encode(buf.getvalue()).decode()}"
 
+# ── Gradio Server (Server mode): FastAPI + Gradio queue/API engine ────────────
+app = Server(title="Flux.2-Klein-KV-Edit-Consistency-Ultra-Fast")
 
-# --- Inference Function ---
-@spaces.GPU()
-def edit_image(
-    gallery_inputs,
+@app.mcp.tool(name="edit_image")
+@app.api(name="edit_image")
+@spaces.GPU(size="xlarge")
+def infer(
+    images_b64_json: str,
     prompt: str,
     seed: int,
     randomize_seed: bool,
     width: int,
     height: int,
     steps: int,
-    progress=gr.Progress(track_tqdm=True),
-):
-    if not prompt or not prompt.strip():
+) -> dict:
+    """Edits an image or generates from text with FLUX.2 Klein 9B KV."""
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    if not prompt or prompt.strip() == "":
         raise gr.Error("Please enter a prompt.")
 
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    pil_images = b64_to_pil_list(images_b64_json)
+    
+    if pil_images:
+        # Calculate dims from first image and resize all
+        calc_w, calc_h = calc_dimensions(pil_images[0])
+        width, height = calc_w, calc_h
+        processed_images = [
+            img.resize((width, height), LANCZOS).convert("RGB") 
+            for img in pil_images
+        ]
+        image_input = processed_images if len(processed_images) > 1 else processed_images[0]
+    else:
+        image_input = None
 
-    current_seed = random.randint(0, MAX_SEED) if randomize_seed else int(seed)
+    # Ensure dimensions are multiples of 8
+    final_width  = max(256, min(1024, round(int(width)  / 8) * 8))
+    final_height = max(256, min(1024, round(int(height) / 8) * 8))
 
-    image_list = None
-    if gallery_inputs and len(gallery_inputs) > 0:
-        try:
-            # Use the first image to calculate reference dimensions
-            first_item = gallery_inputs[0]
-            first_filepath = first_item[0] if isinstance(first_item, (tuple, list)) else first_item
-            first_pil = Image.open(first_filepath).convert("RGB")
+    if randomize_seed:
+        seed = random.randint(0, MAX_SEED)
 
-            calc_w, calc_h = calc_dimensions(first_pil)
-            image_list = parse_and_resize_images(gallery_inputs, calc_w, calc_h)
-
-            # Override manual width/height to match the input aspect ratio
-            width, height = calc_w, calc_h
-        except Exception as e:
-            print(f"Error processing gallery uploads: {e}")
-
-    final_width = max(256, min(MAX_IMAGE_SIZE, round(int(width) / 8) * 8))
-    final_height = max(256, min(MAX_IMAGE_SIZE, round(int(height) / 8) * 8))
-
+    generator = torch.Generator(device="cpu").manual_seed(seed)
+    
     kwargs = dict(
         prompt=prompt,
         height=final_height,
         width=final_width,
         num_inference_steps=int(steps),
+        generator=generator,
     )
-    if image_list is not None:
-        kwargs["image"] = image_list
+    if image_input is not None:
+        kwargs["image"] = image_input
 
-    generator = torch.Generator(device="cpu").manual_seed(current_seed)
-    result = pipe(**kwargs, generator=generator).images[0]
-
-    gc.collect()
-    if torch.cuda.is_available():
+    try:
+        result_image = pipe(**kwargs).images[0]
+        return {"image": pil_to_b64_png(result_image), "seed": seed}
+    except Exception as e:
+        raise e
+    finally:
+        gc.collect()
         torch.cuda.empty_cache()
 
-    return result, current_seed
+
+@app.api(name="load_example", queue=False)
+def load_example(idx: float) -> dict:
+    """Return base64-encoded example images + prompt for a given example index."""
+    try:
+        i = int(idx)
+    except (ValueError, TypeError):
+        i = -1
+    if i < 0 or i >= len(EXAMPLES_CONFIG):
+        return {"images": [], "prompt": "", "names": [], "status": "error"}
+    ex = EXAMPLES_CONFIG[i]
+    b64_list, names = [], []
+    for path in ex["images"]:
+        b64 = encode_full_image(path)
+        if b64:
+            b64_list.append(b64)
+            names.append(os.path.basename(path))
+    return {"images": b64_list, "prompt": ex["prompt"], "names": names, "status": "ok"}
 
 
-with gr.Blocks() as demo:
-    gr.Markdown("# **Flux.2 Klein 9B — KV Consistency Edit [Fast]**")
-    gr.Markdown(
-        "Upload one or more images and enter a prompt to perform fast, consistency-preserving "
-        "edits using the `Klein-Consistency` LoRA adapter on the 9B KV model. "
-        "Leave the gallery empty to generate from text only. [GitHub ↗](https://github.com/PRITHIVSAKTHIUR/flux-klein-kv-edit-consistency-fast)"
-    )
+@app.get("/api/config")
+def client_config():
+    """Plain FastAPI route: example card data for the frontend."""
+    return CLIENT_CONFIG
 
-    with gr.Row():
-        with gr.Column(scale=1):
-            gallery_input = gr.Gallery(
-                label="Input Images (Optional)",
-                type="filepath",
-                height=300,
-                allow_preview=True,
-                elem_id="gallery_input",
-            )
-            prompt_input = gr.Textbox(
-                label="Edit Prompt",
-                placeholder="Describe the edit you want to apply...",
-                lines=3,
-            )
 
-            with gr.Accordion("Advanced Settings", open=False):
-                with gr.Row():
-                    width_slider = gr.Slider(minimum=256, maximum=1024, step=8, value=1024, label="Width")
-                    height_slider = gr.Slider(minimum=256, maximum=1024, step=8, value=1024, label="Height")
+@app.get("/", response_class=HTMLResponse)
+async def homepage():
+    html_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "index.html")
+    with open(html_path, "r", encoding="utf-8") as f:
+        return f.read()
 
-                steps_slider = gr.Slider(minimum=1, maximum=20, step=1, value=4, label="Inference Steps")
-
-                seed_input = gr.Slider(minimum=0, maximum=MAX_SEED, step=1, value=0, label="Seed")
-                randomize_seed_checkbox = gr.Checkbox(label="Randomize Seed", value=True)
-
-            generate_button = gr.Button("Edit Image", variant="primary")
-
-        with gr.Column(scale=1):
-            output_image = gr.Image(label="Generated Output", type="pil", interactive=False, height=390, format="png")
-
-    # Wire up the button
-    generate_button.click(
-        fn=edit_image,
-        inputs=[
-            gallery_input,
-            prompt_input,
-            seed_input,
-            randomize_seed_checkbox,
-            width_slider,
-            height_slider,
-            steps_slider,
-        ],
-        outputs=[output_image, seed_input],
-    )
-
-    # Examples
-    gr.Examples(
-        examples=[
-            [["examples/1.jpg"], "Change the weather to stormy."],
-            [
-                ["examples/2.jpg"],
-                "Transform the scene into a snowy winter day while preserving the original subject identity, framing, and composition.",
-            ],
-            [
-                ["examples/3.jpg"],
-                "Relight the image with soft golden sunset lighting while keeping all structures and subject details consistent.",
-            ],
-            [["examples/4.jpg"], "Make the texture high-resolution."],
-        ],
-        inputs=[gallery_input, prompt_input],
-        outputs=[output_image, seed_input],
-        fn=edit_image,
-        cache_examples=False,
-    )
 
 if __name__ == "__main__":
-    demo.queue().launch(theme=orange_red_theme, ssr_mode=False, mcp_server=True, show_error=True)
+    app.launch(show_error=True, mcp_server=True)
