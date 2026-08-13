@@ -4,6 +4,8 @@ Flux.2-Klein-KV-Edit-Consistency-Ultra-Fast is a high-performance image editing 
 
 The application operates via a FastAPI server (`gradio.Server`) hosting a dark crimson single-page web app (SPA) that features a dual-view canvas, an A/B comparison slider, input and history filmstrips, and quick prompt chips.
 
+<img width="1919" height="845" alt="image" src="https://github.com/user-attachments/assets/f7f8ce9c-466e-4246-85c5-e76d58e43b36" />
+
 ### **Key Features**
 
 * **KV Attention Consistency Engine:** Integrates a core structural patch (`flux2_klein_kv.patch`) over local `diffusers` modules via subprocess initialization to enable Key-Value consistency mechanisms in FLUX.2.
